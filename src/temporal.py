@@ -1,7 +1,6 @@
 # src/main.py
 """
 Full Live ANPR Pipeline — Detection → Alignment → OCR → Validation → CSV Logging.
-Mirrors the structure of recognize.py from Face_recognition_with_Arcface.
 
 Run:
     python -m src.main
@@ -30,7 +29,7 @@ import numpy as np
 from .detect import find_plate_contour, draw_detection
 from .align import warp_plate
 from .ocr import read_plate
-from .validate import is_valid_plate, normalise
+from .validate import is_valid_plate, normalise, fuzzy_match, clean_text
 
 
 # ---------------------------------------------------------------------------
@@ -40,34 +39,65 @@ CONFIRM_THRESHOLD = 5   # same plate text must appear N times before logging
 CSV_PATH = Path("data/plates.csv")
 SCREENSHOTS_DIR = Path("screenshots")
 CAM_INDEX = 0
-OCR_EVERY = 8           # run OCR once every N frames (keeps CPU manageable)
+OCR_EVERY = 6           # slightly more frequent OCR for better accumulation
 
 
 # ---------------------------------------------------------------------------
-# Temporal confirmation buffer
-# (same concept as FaceDBMatcher — track observations over time)
+# Confirmation buffer with fuzzy matching
 # ---------------------------------------------------------------------------
 @dataclass
 class ConfirmationBuffer:
+    """
+    Track observations over time, grouping near-identical readings together.
+
+    The key change from the original: instead of requiring exact string
+    equality, we use fuzzy_match() to accumulate frames where Tesseract
+    reads 'RAB123C' and 'RAB123C' but also 'RAB1Z3C' (a single-char flip)
+    toward the same plate.  The canonical text stored is the most common
+    reading seen so far for that cluster.
+    """
     threshold: int = CONFIRM_THRESHOLD
+    # Maps canonical plate text → count of observations in its cluster
     _counts: Counter = field(default_factory=Counter)
+    # Confirmed plates (never re-logged in the same session)
     _confirmed: set = field(default_factory=set)
 
+    def _find_cluster(self, text: str) -> Optional[str]:
+        """Return the canonical key for an existing cluster that matches text."""
+        for key in self._counts:
+            if fuzzy_match(text, key, max_distance=1):
+                return key
+        return None
+
     def observe(self, text: str) -> bool:
-        """Record an observation. Returns True if this observation triggers confirmation."""
+        """
+        Record an observation. Returns True if this triggers first confirmation.
+        """
         if not text or not is_valid_plate(text):
             return False
-        if text in self._confirmed:
-            return False          # already logged, skip
-        self._counts[text] += 1
-        if self._counts[text] >= self.threshold:
-            self._confirmed.add(text)
+
+        canonical = clean_text(normalise(text))
+
+        # Check if this reading is already confirmed
+        if canonical in self._confirmed:
+            return False
+
+        # Merge into an existing near-match cluster, or start a new one
+        cluster_key = self._find_cluster(canonical)
+        if cluster_key is None:
+            cluster_key = canonical
+
+        self._counts[cluster_key] += 1
+
+        if self._counts[cluster_key] >= self.threshold:
+            self._confirmed.add(cluster_key)
             return True
+
         return False
 
     def reset(self):
         self._counts.clear()
-        # NOTE: _confirmed is kept so we never re-log a plate in one session
+        # _confirmed intentionally kept to avoid double-logging
 
 
 # ---------------------------------------------------------------------------
@@ -134,32 +164,26 @@ def main(cam_index: int = CAM_INDEX):
         vis = frame.copy()
         contour = find_plate_contour(frame)
 
-        # ---- Detection ----
         if contour is not None:
             cv2.drawContours(vis, [contour], -1, (0, 255, 0), 3)
 
-            # ---- Alignment ----
             plate_img, _ = warp_plate(frame, contour)
 
             if plate_img is not None and plate_img.size:
                 last_plate_img = plate_img.copy()
 
-                # ---- OCR (throttled) ----
                 if frame_idx % OCR_EVERY == 0:
                     text = read_plate(plate_img)
                     if text:
                         last_text = text
                         last_valid = is_valid_plate(text)
 
-                        # ---- Temporal Confirmation ----
                         if buf.observe(text):
-                            last_confirmed = text
-                            log_plate(CSV_PATH, text, last_valid)
-                            # Save screenshot on first confirmation
+                            last_confirmed = clean_text(normalise(text))
+                            log_plate(CSV_PATH, last_confirmed, last_valid)
                             ts = int(time.time())
                             cv2.imwrite(str(SCREENSHOTS_DIR / f"confirmed_{ts}.png"), vis)
 
-        # ---- FPS ----
         fps_n += 1
         frame_idx += 1
         dt = time.time() - fps_t0
@@ -168,7 +192,6 @@ def main(cam_index: int = CAM_INDEX):
             fps_n = 0
             fps_t0 = time.time()
 
-        # ---- HUD overlays ----
         plate_color = (0, 255, 0) if last_valid else (0, 0, 255)
         _put(vis, f"Plate: {last_text or '---'}", (10, 35), 0.85, plate_color, 2)
         _put(vis, "VALID" if last_valid else "INVALID", (10, 68), 0.7, plate_color, 2)

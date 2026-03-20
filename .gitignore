@@ -1,2 +1,4 @@
 test_on_image.py
 repo_description.txt
+venv/
+tesseract

@@ -13,7 +13,7 @@ Keys:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 import time
 
 import cv2
@@ -28,10 +28,13 @@ from .validate import normalise, is_valid_plate
 # Tesseract configuration
 # UPDATE THIS PATH IF TESSERACT IS ELSEWHERE ON YOUR SYSTEM
 # ---------------------------------------------------------------------------
-pytesseract.pytesseract.tesseract_cmd = r"D:\tesseract\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\ABAYO HIRWA JOVIN\Downloads\car-number-plate-extraction-main\car-number-plate-extraction-main\tesseract\tesseract\tesseract.exe"
 
-# Tesseract page-segmentation mode 8 = single word, good for plates
-_TESS_CONFIG = "--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+# psm 8 = single word.  Also try psm 7 (single text line) if results are poor.
+_TESS_CONFIG = (
+    "--psm 8 "
+    "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,29 +44,46 @@ _TESS_CONFIG = "--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ012
 def preprocess_plate(plate_bgr: np.ndarray) -> np.ndarray:
     """
     Convert aligned plate to a clean binary image for OCR.
-    Enhanced to remove graph paper grid lines using morphological operations.
+
+    Pipeline (order matters):
+    1. Upscale FIRST — thresholding on a larger image is more accurate.
+    2. CLAHE — normalise contrast across the plate (handles shadows, glare).
+    3. Gaussian blur — suppress high-frequency noise before thresholding.
+    4. Otsu threshold — automatic global threshold, works well after CLAHE.
+    5. Light dilation — thicken thin strokes so Tesseract does not fragment
+       characters.  A 2×2 kernel is enough; larger kernels merge adjacent chars.
+    6. Invert if needed — Tesseract expects dark characters on a light background.
+
+    The original code applied MORPH_OPEN (erosion → dilation) which was
+    destroying thin character strokes (I, 1, thin verticals in R/A/B).
     """
+    # --- Step 1: upscale ---
+    scale = 3  # 3× gives ~900×240px for a 300×80 input — enough for Tesseract
+    h, w = plate_bgr.shape[:2]
     gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Upscale
-    gray = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-    
-    # Adaptive thresholding to handle uneven lighting on paper
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    
-    # Morphological Opening to remove thin lines (the graph grid)
-    # A 3x3 kernel will remove lines thinner than characters
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    # Invert so characters are black on white (if needed by Tesseract, though --psm handles it)
-    # But usually Tesseract prefers black on white. 
-    # Adaptive Threshold above gives white on black if not careful.
-    # Let's ensure black on white.
-    if np.mean(opening) < 127:
-        opening = cv2.bitwise_not(opening)
-        
-    return opening
+    gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+    # --- Step 2: CLAHE ---
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # --- Step 3: gentle blur ---
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # --- Step 4: Otsu binarisation ---
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # --- Step 5: dilate to thicken strokes ---
+    # 2×2 kernel adds ~1px to each character stroke without merging chars
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.dilate(binary, kernel, iterations=1)
+
+    # --- Step 6: ensure dark chars on white background ---
+    # If the majority of pixels are dark, the plate is inverted — flip it.
+    if np.mean(binary) < 127:
+        binary = cv2.bitwise_not(binary)
+
+    return binary
 
 
 def read_plate(plate_bgr: np.ndarray) -> str:
@@ -97,7 +117,6 @@ def main(cam_index: int = 0):
     fps_t0 = time.time()
     fps_n = 0
     fps = 0.0
-    # Throttle OCR to once every N frames to keep UI responsive
     ocr_every = 8
     frame_idx = 0
 
@@ -122,7 +141,6 @@ def main(cam_index: int = 0):
 
         frame_idx += 1
 
-        # FPS
         fps_n += 1
         dt = time.time() - fps_t0
         if dt >= 1.0:
@@ -145,6 +163,9 @@ def main(cam_index: int = 0):
         if key == ord("s"):
             out_path = save_dir / "ocr.png"
             cv2.imwrite(str(out_path), vis)
+            # Also save the preprocessed binary for debugging
+            binary = preprocess_plate(last_plate_img)
+            cv2.imwrite(str(save_dir / "ocr_binary.png"), binary)
             print(f"[ocr] saved: {out_path}  text={last_text!r}")
 
     cap.release()

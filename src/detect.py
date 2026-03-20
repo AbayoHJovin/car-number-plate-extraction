@@ -2,7 +2,6 @@
 """
 Step 1 — Plate Detection.
 Uses edge detection and contour analysis to locate license plates in a frame.
-Modelled after the Face_recognition_with_Arcface detect.py style.
 
 Run standalone:
     python -m src.detect
@@ -14,7 +13,7 @@ Keys:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 import time
 
 import cv2
@@ -26,9 +25,14 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def preprocess(frame: np.ndarray) -> np.ndarray:
-    """Convert to grayscale, blur, and enhance edges for plate localisation."""
+    """Convert to grayscale and apply CLAHE for contrast normalisation."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    # CLAHE handles uneven lighting far better than a flat bilateral filter
+    # for plate detection — it boosts local contrast where chars meet background.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    # Mild blur to suppress noise without killing edges
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
     return gray
 
 
@@ -36,39 +40,62 @@ def find_plate_contour(frame: np.ndarray) -> Optional[np.ndarray]:
     """
     Return the best 4-point contour that likely contains a number plate,
     or None if nothing suitable is found.
+
+    Key changes vs original:
+    - Removed the bitwise_or with inverted adaptive threshold — that was
+      flooding the edge map and returning spurious large contours.
+    - Only accept exactly 4-point approximations; 5-6 point contours are
+      collapsed via convex hull (not bounding box) so tilt is preserved.
+    - Added minimum contour area filter to reject small noise regions.
+    - Tightened aspect ratio to 2.0–7.0 (Rwandan plates are ~4.5:1).
     """
     gray = preprocess(frame)
-    # Adaptive thresholding often works better than Canny for various lighting
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     edged = cv2.Canny(gray, 30, 200)
-    
-    # Combine Canny and Adaptive results
-    edged = cv2.bitwise_or(edged, cv2.bitwise_not(binary))
 
-    # Morphological closing to fill gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # Morphological closing to bridge small gaps in plate edges only
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
     edged = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
 
     cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:50]
+
+    # Sort by area descending; top 30 is enough and avoids noise contours
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:30]
+
+    frame_area = frame.shape[0] * frame.shape[1]
 
     for c in cnts:
+        area = cv2.contourArea(c)
+        # Reject contours that are too small (noise) or suspiciously large
+        # (frame border, hand, background objects)
+        if area < 1500 or area > frame_area * 0.25:
+            continue
+
         peri = cv2.arcLength(c, True)
-        # Try a few approximation strengths
-        for eps in [0.01, 0.02, 0.03]:
+
+        # Try a conservative epsilon first, then relax slightly
+        for eps in [0.015, 0.02, 0.025, 0.03]:
             approx = cv2.approxPolyDP(c, eps * peri, True)
-            
-            # Usually 4, but hand-held paper sometimes has 5-6 due to fingers/folds
-            if 4 <= len(approx) <= 6:
+
+            if len(approx) == 4:
                 x, y, w, h = cv2.boundingRect(approx)
                 aspect = w / float(h)
-                # Relaxed ratio: 1.2 to 9.0
-                if 1.2 <= aspect <= 9.0 and w > 60:
-                    # If we have 5-6 pts, just take the bounding box as the 4 corners
-                    if len(approx) > 4:
-                        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+                # Rwandan plates: ~520mm × 110mm ≈ 4.7:1
+                # Allow 2.0–7.0 to handle mild perspective distortion
+                if 2.0 <= aspect <= 7.0 and w > 80:
                     return approx
-                
+
+            elif 5 <= len(approx) <= 8:
+                # Use convex hull to reduce to a clean quadrilateral —
+                # this preserves the actual corner positions unlike bbox.
+                hull = cv2.convexHull(approx)
+                hull_peri = cv2.arcLength(hull, True)
+                quad = cv2.approxPolyDP(hull, 0.02 * hull_peri, True)
+                if len(quad) == 4:
+                    x, y, w, h = cv2.boundingRect(quad)
+                    aspect = w / float(h)
+                    if 2.0 <= aspect <= 7.0 and w > 80:
+                        return quad
+
     return None
 
 
@@ -128,7 +155,6 @@ def main(cam_index: int = 0):
         contour = find_plate_contour(frame)
         vis = draw_detection(frame, contour)
 
-        # FPS counter
         fps_n += 1
         dt = time.time() - fps_t0
         if dt >= 1.0:
